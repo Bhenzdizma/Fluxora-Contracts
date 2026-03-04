@@ -2644,6 +2644,72 @@ fn test_withdraw_requires_recipient_authorization() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — withdraw_to (#219)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_withdraw_to_destination_receives_tokens() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(400);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+
+    assert_eq!(amount, 400);
+    assert_eq!(ctx.token().balance(&destination), 400);
+    assert_eq!(ctx.token().balance(&ctx.recipient), 0);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 400);
+}
+
+#[test]
+fn test_withdraw_to_full_amount_completes_stream() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(1000);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+
+    assert_eq!(amount, 1000);
+    assert_eq!(ctx.token().balance(&destination), 1000);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+}
+
+#[test]
+fn test_withdraw_to_requires_recipient_auth() {
+    let ctx = TestContext::setup_strict();
+    use soroban_sdk::testutils::MockAuth;
+    use soroban_sdk::testutils::MockAuthInvoke;
+    use soroban_sdk::IntoVal;
+
+    ctx.env.ledger().set_timestamp(0);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.sender,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_stream",
+            args: (
+                &ctx.sender,
+                &ctx.recipient,
+                1000_i128,
+                1_i128,
+                0u64,
+                0u64,
+                1000u64,
+            )
+                .into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.sender, &ctx.contract_id, 1000_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    let stream_id = ctx.client().create_stream(
 // Tests — batch_withdraw (#220)
 // ---------------------------------------------------------------------------
 
@@ -2712,6 +2778,65 @@ fn test_batch_withdraw_mixed_state_some_zero() {
         &1000u64,
     );
 
+    let destination = Address::generate(&ctx.env);
+    ctx.env.ledger().set_timestamp(300);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "withdraw_to",
+            args: (stream_id, destination.clone()).into_val(&ctx.env),
+            sub_invokes: &[MockAuthInvoke {
+                contract: &ctx.token_id,
+                fn_name: "transfer",
+                args: (&ctx.contract_id, &destination, 300_i128).into_val(&ctx.env),
+                sub_invokes: &[],
+            }],
+        },
+    }]);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+    assert_eq!(amount, 300);
+    assert_eq!(ctx.token().balance(&destination), 300);
+}
+
+#[test]
+#[should_panic(expected = "destination must not be the contract")]
+fn test_withdraw_to_rejects_contract_as_destination() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw_to(&stream_id, &ctx.contract_id);
+}
+
+#[test]
+fn test_withdraw_to_zero_withdrawable_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff at 500
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(100);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+
+    assert_eq!(amount, 0);
+    assert_eq!(ctx.token().balance(&destination), 0);
+}
+
+#[test]
+fn test_withdraw_to_after_partial_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+    let destination = Address::generate(&ctx.env);
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+
+    ctx.env.ledger().set_timestamp(700);
+    let amount = ctx.client().withdraw_to(&stream_id, &destination);
+
+    assert_eq!(amount, 400);
+    assert_eq!(ctx.token().balance(&ctx.recipient), 300);
+    assert_eq!(ctx.token().balance(&destination), 400);
     // Complete id0 so it has 0 withdrawable
     ctx.env.ledger().set_timestamp(1000);
     ctx.client().withdraw(&id0);
