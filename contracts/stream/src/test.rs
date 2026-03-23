@@ -8708,7 +8708,7 @@ fn test_create_stream_exact_minimum_deposit_stored_fields_are_exact() {
 /// - Only the sender (the address passed as first argument) is required to authorise.
 /// - The recipient requires no auth at creation time.
 /// - The admin requires no auth at creation time.
-/// This is tested via setup_strict() where only mocked auths are honoured.
+///   This is tested via setup_strict() where only mocked auths are honoured.
 #[test]
 fn test_create_stream_only_sender_auth_required() {
     let ctx = TestContext::setup_strict();
