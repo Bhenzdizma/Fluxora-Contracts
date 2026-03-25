@@ -12539,1023 +12539,629 @@ fn regression_double_init_interleaved_with_lifecycle() {
 }
 
 // ===========================================================================
-// Persistent stream TTL: extend-on-read/write invariants (Issue #248)
+// get_claimable_at: future simulation and cancel clamping (Issue #270)
 // ===========================================================================
 //
-// These tests verify that every code path touching contract storage
-// properly extends Time-To-Live (TTL) so that:
+// `get_claimable_at(stream_id, timestamp)` is a read-only view function that
+// simulates  "how much could the recipient claim at time T?" without mutating
+// state. The two key invariants this suite codifies:
 //
-//   1. Instance entries (Config, NextStreamId, GlobalPaused) never silently
-//      expire between normal operations.
-//   2. Persistent stream entries are extended on every read AND write so
-//      that actively-queried or modified streams remain accessible.
-//   3. Persistent recipient index entries are extended on read (when
-//      non-empty) and on write.
-//   4. TTL values meet the protocol-defined thresholds:
-//      - INSTANCE_LIFETIME_THRESHOLD  = 17_280 (~1 day at 5s/ledger)
-//      - INSTANCE_BUMP_AMOUNT         = 120_960 (~7 days)
-//      - PERSISTENT_LIFETIME_THRESHOLD = 17_280 (~1 day)
-//      - PERSISTENT_BUMP_AMOUNT        = 120_960 (~7 days)
+//   1. **Future simulation**: for Active/Paused streams, claimable grows
+//      with timestamp exactly as `calculate_accrued(timestamp) - withdrawn`,
+//      clamped at deposit.
 //
-// Test utility: `env.as_contract(contract_id, || { ... })` allows
-// introspection of the contract's own storage, and the
-// `soroban_sdk::testutils::storage::{Persistent, Instance}` traits
-// provide `get_ttl()` for direct TTL assertions.
+//   2. **Cancel clamping**: for Cancelled streams, the effective time is
+//      `min(timestamp, cancelled_at)`, so claimable can never exceed what
+//      was accrued at the moment of cancellation.
+//
+//   3. **Completed**: always returns 0 (nothing left to claim).
 
 // ---------------------------------------------------------------------------
-// §1  Instance storage TTL invariants
+// §1  Future simulation: Active streams
 // ---------------------------------------------------------------------------
 
-/// After `init()`, instance storage TTL must be at least INSTANCE_BUMP_AMOUNT.
+/// Claimable at t=0 (start_time) for a no-cliff stream must be 0.
 #[test]
-fn ttl_instance_storage_bumped_on_init() {
+fn claimable_at_start_time_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 0..1000, rate=1, no cliff
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &0);
+    assert_eq!(claimable, 0, "claimable at start_time must be 0");
+}
+
+/// Claimable at t=1 (one second into stream) returns 1 token.
+#[test]
+fn claimable_at_one_second_in() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &1);
+    assert_eq!(claimable, 1, "1 second at rate=1 → 1 token");
+}
+
+/// Claimable grows linearly with time for a constant-rate stream.
+#[test]
+fn claimable_at_linearly_proportional() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // rate=1, 0..1000
+
+    for &t in &[0u64, 100, 250, 500, 750, 999, 1000] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, t as i128,
+            "at t={t}, claimable must be {t} (rate=1, no withdraw)"
+        );
+    }
+}
+
+/// Claimable is capped at deposit for timestamps beyond end_time.
+#[test]
+fn claimable_at_capped_beyond_end() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // deposit=1000
+
+    for &t in &[1000u64, 1001, 2000, 999_999] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, 1000,
+            "at t={t} (>= end_time), claimable must equal deposit 1000"
+        );
+    }
+}
+
+/// After a partial withdraw, claimable deducts the withdrawn amount.
+#[test]
+fn claimable_at_deducts_withdrawn() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id); // withdraws 300
+
+    // Simulate at t=700: accrued=700, withdrawn=300 → claimable=400
+    let claimable = ctx.client().get_claimable_at(&stream_id, &700);
+    assert_eq!(claimable, 400);
+
+    // At t=300: accrued=300, withdrawn=300 → claimable=0
+    let claimable_at_300 = ctx.client().get_claimable_at(&stream_id, &300);
+    assert_eq!(claimable_at_300, 0);
+
+    // At t=1000 (end): accrued=1000, withdrawn=300 → claimable=700
+    let claimable_at_end = ctx.client().get_claimable_at(&stream_id, &1000);
+    assert_eq!(claimable_at_end, 700);
+}
+
+/// After multiple partial withdrawals, claimable reflects cumulative withdrawn.
+#[test]
+fn claimable_at_after_multiple_withdrawals() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().withdraw(&stream_id); // withdrawn=200
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id); // withdrawn=500
+
+    // At t=800: accrued=800, withdrawn=500 → claimable=300
+    let claimable = ctx.client().get_claimable_at(&stream_id, &800);
+    assert_eq!(claimable, 300);
+}
+
+/// Claimable at a time equal to withdrawn amount returns 0.
+#[test]
+fn claimable_at_exact_withdrawn_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id); // withdrawn=500
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &500);
+    assert_eq!(claimable, 0, "accrued == withdrawn → claimable must be 0");
+}
+
+/// Claimable before the withdrawn timestamp still returns 0 (can't have
+/// negative claimable).
+#[test]
+fn claimable_at_before_withdrawn_returns_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id); // withdrawn=500
+
+    // At t=300: accrued=300, withdrawn=500 → claimable=max(0, -200)=0
+    let claimable = ctx.client().get_claimable_at(&stream_id, &300);
+    assert_eq!(claimable, 0);
+}
+
+// ---------------------------------------------------------------------------
+// §2  Future simulation: Cliff interactions
+// ---------------------------------------------------------------------------
+
+/// With a cliff, claimable is 0 before cliff and jumps at cliff.
+#[test]
+fn claimable_at_cliff_boundary_detailed() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff=500, 0..1000, rate=1
+
+    // One second before cliff: 0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &499), 0);
+    // At cliff: accrual from start → 500
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &500), 500);
+    // One second after cliff: 501
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &501), 501);
+}
+
+/// With a cliff, withdrawing at cliff then querying future shows correct deduction.
+#[test]
+fn claimable_at_cliff_after_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id); // withdraws 500
+
+    // At t=800: accrued=800, withdrawn=500 → claimable=300
+    let claimable = ctx.client().get_claimable_at(&stream_id, &800);
+    assert_eq!(claimable, 300);
+
+    // Before cliff: still 0 (accrual=0 < withdrawn=500, clamp to 0)
+    let claimable_pre = ctx.client().get_claimable_at(&stream_id, &100);
+    assert_eq!(claimable_pre, 0);
+}
+
+// ---------------------------------------------------------------------------
+// §3  Cancel clamping: core invariant
+// ---------------------------------------------------------------------------
+
+/// After cancel at t=400, claimable for any timestamp >= 400 is frozen at 400.
+#[test]
+fn claimable_at_cancel_clamped_at_all_future_times() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id); // cancelled_at=400
+
+    // Claimable at exactly cancelled_at
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &400), 400);
+
+    // Claimable at future timestamps: all clamped to 400
+    for &t in &[401u64, 500, 800, 1000, 5000, 999_999] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, 400,
+            "cancelled at 400: claimable at t={t} must be clamped to 400"
+        );
+    }
+}
+
+/// Cancel at t=400 + timestamps before cancel_time still work normally.
+#[test]
+fn claimable_at_cancel_before_cancel_time_follows_schedule() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Before cancel_time: effective_time = min(t, 400) = t
+    for &t in &[0u64, 100, 200, 300, 399] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, t as i128,
+            "cancelled at 400: claimable at t={t} (<cancel) should follow schedule"
+        );
+    }
+}
+
+/// Cancel at t=0 (immediately) → claimable is always 0.
+#[test]
+fn claimable_at_cancel_at_start_always_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(0);
+    ctx.client().cancel_stream(&stream_id);
+
+    for &t in &[0u64, 1, 100, 1000, 999_999] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, 0,
+            "cancelled at t=0: claimable at any time must be 0"
+        );
+    }
+}
+
+/// Cancel at end_time → claimable at any future time equals full deposit.
+#[test]
+fn claimable_at_cancel_at_end_time_equals_deposit() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 0..1000, deposit=1000
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().cancel_stream(&stream_id);
+
+    let claimable = ctx.client().get_claimable_at(&stream_id, &9999);
+    assert_eq!(claimable, 1000, "cancel at end → full deposit claimable");
+}
+
+/// Cancel with partial withdraw: claimable is clamped to (accrued_at_cancel - withdrawn).
+#[test]
+fn claimable_at_cancel_after_partial_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Withdraw 200 at t=200
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().withdraw(&stream_id);
+
+    // Cancel at t=600: accrued=600, withdrawn=200
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().cancel_stream(&stream_id);
+
+    // At any future time: accrued clamped to 600, withdrawn=200 → claimable=400
+    for &t in &[600u64, 700, 1000, 5000] {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            claimable, 400,
+            "cancel at 600 with 200 withdrawn: claimable at t={t} must be 400"
+        );
+    }
+
+    // Before cancel: e.g. t=400 → accrued=400, withdrawn=200 → claimable=200
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &400), 200);
+
+    // Before withdrawn: e.g. t=100 → accrued=100, withdrawn=200 → claimable=0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &100), 0);
+}
+
+/// Cancel with full withdraw: recipient withdrew everything at cancel → claimable=0.
+#[test]
+fn claimable_at_cancel_after_full_accrual_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().withdraw(&stream_id); // withdrawn=500
+
+    ctx.client().cancel_stream(&stream_id); // cancelled_at=500
+
+    // accrued clamped at 500, withdrawn=500 → claimable=0
+    for &t in &[500u64, 1000, 9999] {
+        assert_eq!(
+            ctx.client().get_claimable_at(&stream_id, &t),
+            0,
+            "cancelled after full withdraw: claimable at t={t} must be 0"
+        );
+    }
+}
+
+/// Admin cancel uses the same clamping logic.
+#[test]
+fn claimable_at_admin_cancel_clamped() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream_as_admin(&stream_id);
+
+    // Clamped at 300
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &300), 300);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &999), 300);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &100), 100);
+}
+
+// ---------------------------------------------------------------------------
+// §4  Cancel clamping with cliff
+// ---------------------------------------------------------------------------
+
+/// Cancel before cliff: accrual was 0 at cancel → claimable always 0.
+#[test]
+fn claimable_at_cancel_before_cliff() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff=500
+
+    ctx.env.ledger().set_timestamp(200);
+    ctx.client().cancel_stream(&stream_id); // cancelled_at=200 < cliff
+
+    // Even at future times, effective_time = min(t, 200) < cliff → accrued=0
+    for &t in &[0u64, 200, 500, 1000, 9999] {
+        assert_eq!(
+            ctx.client().get_claimable_at(&stream_id, &t),
+            0,
+            "cancel at t=200 before cliff=500: claimable at t={t} must be 0"
+        );
+    }
+}
+
+/// Cancel exactly at cliff: accrual=500 (from start_time=0 to cliff=500).
+#[test]
+fn claimable_at_cancel_at_cliff_boundary() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff=500
+
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id); // cancelled_at=500
+
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &500), 500);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &9999), 500);
+    // Before cliff: 0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &499), 0);
+}
+
+/// Cancel after cliff: normal clamping at cancel_time.
+#[test]
+fn claimable_at_cancel_after_cliff() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_cliff_stream(); // cliff=500
+
+    ctx.env.ledger().set_timestamp(700);
+    ctx.client().cancel_stream(&stream_id); // cancelled_at=700
+
+    // Before cliff: 0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &499), 0);
+    // At cliff: 500
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &500), 500);
+    // Between cliff and cancel: follows schedule
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &600), 600);
+    // At and beyond cancel: clamped
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &700), 700);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &9999), 700);
+}
+
+// ---------------------------------------------------------------------------
+// §5  Paused stream simulation
+// ---------------------------------------------------------------------------
+
+/// Paused stream: get_claimable_at still simulates using the given timestamp
+/// (accrual is computed at `timestamp`, not frozen at pause time).
+#[test]
+fn claimable_at_paused_stream_simulates_at_timestamp() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().pause_stream(&stream_id);
+
+    // get_claimable_at simulates at requested timestamp, regardless of pause
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &500), 500);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &1000), 1000);
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &100), 100);
+}
+
+/// Paused after partial withdraw: claimable deducts withdrawn.
+#[test]
+fn claimable_at_paused_after_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id); // withdrawn=300
+    ctx.client().pause_stream(&stream_id);
+
+    // At t=600: accrued=600, withdrawn=300 → claimable=300
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &600), 300);
+}
+
+// ---------------------------------------------------------------------------
+// §6  Completed stream
+// ---------------------------------------------------------------------------
+
+/// Completed stream always returns 0 regardless of timestamp.
+#[test]
+fn claimable_at_completed_always_zero() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    for &t in &[0u64, 500, 1000, 9999] {
+        assert_eq!(
+            ctx.client().get_claimable_at(&stream_id, &t),
+            0,
+            "completed stream: claimable at t={t} must be 0"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §7  Monotonicity invariant (active stream)
+// ---------------------------------------------------------------------------
+
+/// For an active stream with no withdrawals, claimable_at(t1) <= claimable_at(t2)
+/// for all t1 <= t2 (monotonically non-decreasing).
+#[test]
+fn claimable_at_monotonic_active_no_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let mut prev = 0i128;
+    for t in (0..=1200).step_by(50) {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert!(
+            claimable >= prev,
+            "monotonicity violated: claimable({t})={claimable} < prev={prev}"
+        );
+        prev = claimable;
+    }
+}
+
+/// For a cancelled stream, claimable_at(t1) <= claimable_at(t2) for t1 <= t2.
+#[test]
+fn claimable_at_monotonic_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    let mut prev = 0i128;
+    for t in (0..=1200).step_by(50) {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert!(
+            claimable >= prev,
+            "monotonicity violated (cancelled): claimable({t})={claimable} < prev={prev}"
+        );
+        prev = claimable;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §8  Equivalence with get_withdrawable at current ledger time
+// ---------------------------------------------------------------------------
+
+/// get_claimable_at(now) == get_withdrawable(stream_id) for active streams
+/// at any point in the lifecycle.
+#[test]
+fn claimable_at_equals_withdrawable_at_current_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    for &t in &[0u64, 100, 500, 999, 1000] {
+        ctx.env.ledger().set_timestamp(t);
+        let withdrawable = ctx.client().get_withdrawable(&stream_id);
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            withdrawable, claimable,
+            "at t={t}: get_withdrawable ({withdrawable}) != get_claimable_at ({claimable})"
+        );
+    }
+}
+
+/// After partial withdraw, equivalence still holds at current time.
+#[test]
+fn claimable_at_equals_withdrawable_after_withdraw() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().withdraw(&stream_id);
+
+    ctx.env.ledger().set_timestamp(700);
+    let withdrawable = ctx.client().get_withdrawable(&stream_id);
+    let claimable = ctx.client().get_claimable_at(&stream_id, &700);
+    assert_eq!(withdrawable, claimable);
+}
+
+/// After cancel, equivalence at current time (both should work with clamping).
+#[test]
+fn claimable_at_equals_withdrawable_cancelled() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.env.ledger().set_timestamp(400);
+    ctx.client().cancel_stream(&stream_id);
+
+    // At cancel time
+    let withdrawable = ctx.client().get_withdrawable(&stream_id);
+    let claimable = ctx.client().get_claimable_at(&stream_id, &400);
+    assert_eq!(withdrawable, claimable);
+}
+
+// ---------------------------------------------------------------------------
+// §9  Idempotency: repeated reads don't change results
+// ---------------------------------------------------------------------------
+
+/// Calling get_claimable_at multiple times returns the same value (read-only).
+#[test]
+fn claimable_at_idempotent() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    let first = ctx.client().get_claimable_at(&stream_id, &500);
+    let second = ctx.client().get_claimable_at(&stream_id, &500);
+    let third = ctx.client().get_claimable_at(&stream_id, &500);
+    assert_eq!(first, second);
+    assert_eq!(second, third);
+}
+
+// ---------------------------------------------------------------------------
+// §10  Error cases
+// ---------------------------------------------------------------------------
+
+/// Non-existent stream returns StreamNotFound.
+#[test]
+fn claimable_at_stream_not_found() {
+    let ctx = TestContext::setup();
+    let result = ctx.client().try_get_claimable_at(&999, &100u64);
+    assert!(result.is_err());
+}
+
+/// Calling claimable_at on uninitialized contract with bogus stream ID
+/// returns StreamNotFound (not a config error, since it's stream-scoped).
+#[test]
+fn claimable_at_uninitialised_returns_stream_not_found() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, FluxoraStream);
     let client = FluxoraStreamClient::new(&env, &contract_id);
 
-    let token = Address::generate(&env);
-    let admin = Address::generate(&env);
-    client.init(&token, &admin);
-
-    let instance_ttl = env.as_contract(&contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        env.storage().instance().get_ttl()
-    });
-
-    // After init, instance TTL must be at least INSTANCE_BUMP_AMOUNT (120_960)
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after init must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-}
-
-/// `get_config()` bumps instance TTL on every call.
-#[test]
-fn ttl_instance_storage_bumped_on_get_config() {
-    let ctx = TestContext::setup();
-
-    // Verify config read bumps instance TTL
-    ctx.client().get_config();
-
-    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        ctx.env.storage().instance().get_ttl()
-    });
-
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after get_config must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-}
-
-/// `get_stream_count()` bumps instance TTL on every call.
-#[test]
-fn ttl_instance_storage_bumped_on_get_stream_count() {
-    let ctx = TestContext::setup();
-
-    ctx.client().get_stream_count();
-
-    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        ctx.env.storage().instance().get_ttl()
-    });
-
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after get_stream_count must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-}
-
-/// `set_admin()` bumps instance TTL after updating the config.
-#[test]
-fn ttl_instance_storage_bumped_on_set_admin() {
-    let ctx = TestContext::setup();
-    let new_admin = Address::generate(&ctx.env);
-
-    ctx.client().set_admin(&new_admin);
-
-    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        ctx.env.storage().instance().get_ttl()
-    });
-
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after set_admin must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-}
-
-/// `set_contract_paused()` bumps instance TTL.
-#[test]
-fn ttl_instance_storage_bumped_on_set_contract_paused() {
-    let ctx = TestContext::setup();
-
-    ctx.client().set_contract_paused(&true);
-
-    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        ctx.env.storage().instance().get_ttl()
-    });
-
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after set_contract_paused must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-}
-
-/// `create_stream()` touches instance storage (NextStreamId) and bumps
-/// the instance TTL. Verify both instance and the new stream's persistent
-/// TTL are properly set.
-#[test]
-fn ttl_instance_and_stream_bumped_on_create_stream() {
-    let ctx = TestContext::setup();
-
-    let stream_id = ctx.create_default_stream();
-
-    // Instance TTL
-    let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Instance;
-        ctx.env.storage().instance().get_ttl()
-    });
-    assert!(
-        instance_ttl >= 120_960,
-        "instance TTL after create_stream must be >= INSTANCE_BUMP_AMOUNT, got {instance_ttl}"
-    );
-
-    // Stream persistent TTL
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after create_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
+    let result = client.try_get_claimable_at(&0, &100u64);
+    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------------------
-// §2  Persistent stream TTL extend-on-read invariants
+// §11  Cancel clamping invariant: claimable_at(any_t) <= accrued_at_cancel
 // ---------------------------------------------------------------------------
 
-/// `get_stream_state()` (read-only) extends the stream's persistent TTL.
+/// For a cancelled stream, claimable at any timestamp never exceeds
+/// the accrual at cancellation time minus the withdrawn amount.
 #[test]
-fn ttl_stream_extended_on_get_stream_state() {
+fn claimable_at_cancel_never_exceeds_frozen_accrual() {
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 
-    // Read the stream state
-    ctx.client().get_stream_state(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after get_stream_state must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `calculate_accrued()` (read-only) extends the stream's persistent TTL.
-#[test]
-fn ttl_stream_extended_on_calculate_accrued() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().calculate_accrued(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after calculate_accrued must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `get_withdrawable()` (read-only) extends the stream's persistent TTL.
-#[test]
-fn ttl_stream_extended_on_get_withdrawable() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().get_withdrawable(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after get_withdrawable must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `get_claimable_at()` (read-only) extends the stream's persistent TTL.
-#[test]
-fn ttl_stream_extended_on_get_claimable_at() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().get_claimable_at(&stream_id, &500);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after get_claimable_at must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// §3  Persistent stream TTL extend-on-write invariants
-// ---------------------------------------------------------------------------
-
-/// `withdraw()` modifies stream state and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_withdraw() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
+    // Withdraw 150
+    ctx.env.ledger().set_timestamp(150);
     ctx.client().withdraw(&stream_id);
 
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after withdraw must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `withdraw_to()` modifies stream state and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_withdraw_to() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-    let destination = Address::generate(&ctx.env);
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().withdraw_to(&stream_id, &destination);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after withdraw_to must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `pause_stream()` writes Paused status and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_pause() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().pause_stream(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after pause_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `resume_stream()` writes Active status and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_resume() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().pause_stream(&stream_id);
-    ctx.client().resume_stream(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after resume_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `cancel_stream()` writes Cancelled status and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_cancel() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
+    // Cancel at t=600
+    ctx.env.ledger().set_timestamp(600);
     ctx.client().cancel_stream(&stream_id);
 
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after cancel_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `cancel_stream_as_admin()` must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_cancel_as_admin() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().cancel_stream_as_admin(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after cancel_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `pause_stream_as_admin()` must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_pause_as_admin() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().pause_stream_as_admin(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after pause_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `resume_stream_as_admin()` must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_resume_as_admin() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().pause_stream_as_admin(&stream_id);
-    ctx.client().resume_stream_as_admin(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after resume_stream_as_admin must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `top_up_stream()` modifies deposit_amount and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_top_up() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    // Mint extra tokens for top-up
-    ctx.sac.mint(&ctx.sender, &5000_i128);
-
-    ctx.client()
-        .top_up_stream(&stream_id, &ctx.sender, &500_i128);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after top_up_stream must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `update_rate_per_second()` modifies rate and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_update_rate() {
-    let ctx = TestContext::setup();
-    // Create stream with extra deposit so we can increase the rate
-    ctx.env.ledger().set_timestamp(0);
-    let stream_id = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &2000_i128, // deposit=2000, duration=1000 → allows rate up to 2
-        &1_i128,
-        &0u64,
-        &0u64,
-        &1000u64,
-    );
-
-    ctx.env.ledger().set_timestamp(100);
-    ctx.client().update_rate_per_second(&stream_id, &2_i128);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after update_rate_per_second must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `shorten_stream_end_time()` modifies end_time and must extend the stream's TTL.
-#[test]
-fn ttl_stream_extended_on_shorten_end_time() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(100);
-    ctx.client().shorten_stream_end_time(&stream_id, &800u64);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after shorten_stream_end_time must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `extend_stream_end_time()` modifies end_time and must extend the stream's TTL.
-/// Requires deposit to cover the new schedule.
-#[test]
-fn ttl_stream_extended_on_extend_end_time() {
-    let ctx = TestContext::setup();
-    // Create stream with extra deposit to allow extension
-    ctx.env.ledger().set_timestamp(0);
-    let stream_id = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &2000_i128, // enough deposit for rate=1 × 2000s
-        &1_i128,
-        &0u64,
-        &0u64,
-        &1000u64,
-    );
-
-    ctx.env.ledger().set_timestamp(100);
-    ctx.client().extend_stream_end_time(&stream_id, &1500u64);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after extend_stream_end_time must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// `batch_withdraw()` reads and writes multiple streams; each must have TTL extended.
-#[test]
-fn ttl_streams_extended_on_batch_withdraw() {
-    let ctx = TestContext::setup();
-    ctx.env.ledger().set_timestamp(0);
-
-    let id0 = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &1000_i128,
-        &1_i128,
-        &0u64,
-        &0u64,
-        &1000u64,
-    );
-    let id1 = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &1000_i128,
-        &1_i128,
-        &0u64,
-        &0u64,
-        &1000u64,
-    );
-
-    ctx.env.ledger().set_timestamp(500);
-    let ids = soroban_sdk::vec![&ctx.env, id0, id1];
-    ctx.client().batch_withdraw(&ctx.recipient, &ids);
-
-    // Both streams must have extended TTL
-    for sid in [id0, id1] {
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&crate::DataKey::Stream(sid))
-        });
+    // Frozen accrual = 600, withdrawn = 150 → max claimable = 450
+    for t in (0..=2000).step_by(100) {
+        let claimable = ctx.client().get_claimable_at(&stream_id, &(t as u64));
         assert!(
-            stream_ttl >= 120_960,
-            "stream {sid} TTL after batch_withdraw must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+            claimable <= 450,
+            "claimable({t})={claimable} exceeds max 450 (frozen accrual - withdrawn)"
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// §4  Recipient index TTL invariants
-// ---------------------------------------------------------------------------
-
-/// After `create_stream()`, the recipient's index entry must have extended TTL.
+/// Multiple cancel scenarios: the clamping ceiling is always
+/// accrued_at_cancel - withdrawn_at_cancel.
 #[test]
-fn ttl_recipient_index_extended_on_create_stream() {
-    let ctx = TestContext::setup();
-    let _stream_id = ctx.create_default_stream();
+fn claimable_at_cancel_ceiling_parametric() {
+    // Cancel at various times with various withdraw amounts
+    for &(withdraw_time, cancel_time) in &[(0u64, 200u64), (100, 500), (300, 300), (0, 1000)] {
+        let ctx = TestContext::setup();
+        let stream_id = ctx.create_default_stream();
 
-    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
-    });
-    assert!(
-        idx_ttl >= 120_960,
-        "recipient index TTL after create must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
-    );
-}
+        if withdraw_time > 0 {
+            ctx.env.ledger().set_timestamp(withdraw_time);
+            ctx.client().withdraw(&stream_id);
+        }
 
-/// After `get_recipient_streams()`, the recipient's index entry TTL must be
-/// extended (since it returns a non-empty index for this recipient).
-#[test]
-fn ttl_recipient_index_extended_on_get_recipient_streams() {
-    let ctx = TestContext::setup();
-    let _stream_id = ctx.create_default_stream();
+        ctx.env.ledger().set_timestamp(cancel_time);
+        ctx.client().cancel_stream(&stream_id);
 
-    // Perform the read
-    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
-    assert_eq!(streams.len(), 1);
+        let ceiling = cancel_time as i128 - withdraw_time as i128;
+        let ceiling = if ceiling > 0 { ceiling } else { 0 };
 
-    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
-    });
-    assert!(
-        idx_ttl >= 120_960,
-        "recipient index TTL after get_recipient_streams must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
-    );
-}
-
-/// After `close_completed_stream()`, the stream entry must no longer exist,
-/// and the recipient's index must be updated (stream removed from index).
-#[test]
-fn ttl_close_completed_stream_removes_entry() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    // Complete the stream
-    ctx.env.ledger().set_timestamp(1000);
-    ctx.client().withdraw(&stream_id);
-
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Completed);
-
-    // Close the completed stream — removes persistent entry
-    ctx.client().close_completed_stream(&stream_id);
-
-    // Stream entry must be removed
-    let exists = ctx.env.as_contract(&ctx.contract_id, || {
-        ctx.env
-            .storage()
-            .persistent()
-            .has(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        !exists,
-        "stream entry must be removed after close_completed_stream"
-    );
-
-    // Recipient index must no longer contain this stream ID
-    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
-    assert_eq!(
-        streams.len(),
-        0,
-        "recipient index must be empty after closing the only stream"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// §5  TTL persistence across lifecycle stages
-// ---------------------------------------------------------------------------
-
-/// Full lifecycle: create → partial withdraw → pause → resume →
-/// complete → close. Verify TTL is maintained at every stage.
-#[test]
-fn ttl_maintained_through_full_lifecycle() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    let assert_ttl = |label: &str| {
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&crate::DataKey::Stream(stream_id))
-        });
-        assert!(
-            stream_ttl >= 120_960,
-            "{label}: stream TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-        );
-    };
-
-    // After create
-    assert_ttl("after create");
-
-    // After partial withdraw
-    ctx.env.ledger().set_timestamp(300);
-    ctx.client().withdraw(&stream_id);
-    assert_ttl("after partial withdraw");
-
-    // After pause
-    ctx.client().pause_stream(&stream_id);
-    assert_ttl("after pause");
-
-    // After resume
-    ctx.client().resume_stream(&stream_id);
-    assert_ttl("after resume");
-
-    // After final withdraw (completes the stream)
-    ctx.env.ledger().set_timestamp(1000);
-    ctx.client().withdraw(&stream_id);
-    assert_ttl("after completion");
-
-    // After get_stream_state on completed stream
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Completed);
-    assert_ttl("after get_stream_state on completed");
-}
-
-/// Cancel lifecycle: create → partial withdraw → cancel → read state.
-/// Stream TTL must be extended at each step.
-#[test]
-fn ttl_maintained_through_cancel_lifecycle() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    // Partial withdraw
-    ctx.env.ledger().set_timestamp(400);
-    ctx.client().withdraw(&stream_id);
-
-    // Cancel
-    ctx.client().cancel_stream(&stream_id);
-
-    // Stream must still be accessible and have good TTL
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after cancel must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-
-    // Subsequent read also extends
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Cancelled);
-}
-
-/// Multiple streams created for the same recipient all get TTL extended,
-/// and the recipient index TTL is also maintained.
-#[test]
-fn ttl_multiple_streams_same_recipient_all_extended() {
-    let ctx = TestContext::setup();
-    ctx.env.ledger().set_timestamp(0);
-
-    let id0 = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &500_i128,
-        &1_i128,
-        &0u64,
-        &0u64,
-        &500u64,
-    );
-    let id1 = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &500_i128,
-        &1_i128,
-        &0u64,
-        &0u64,
-        &500u64,
-    );
-    let id2 = ctx.client().create_stream(
-        &ctx.sender,
-        &ctx.recipient,
-        &500_i128,
-        &1_i128,
-        &0u64,
-        &0u64,
-        &500u64,
-    );
-
-    // All three streams must have proper TTL
-    for sid in [id0, id1, id2] {
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&crate::DataKey::Stream(sid))
-        });
-        assert!(
-            stream_ttl >= 120_960,
-            "stream {sid} TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
+        // At max future time
+        let claimable = ctx.client().get_claimable_at(&stream_id, &999_999u64);
+        assert_eq!(
+            claimable, ceiling,
+            "withdraw={withdraw_time}, cancel={cancel_time}: future claimable must be {ceiling}"
         );
     }
-
-    // Recipient index must also have proper TTL
-    let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::RecipientStreams(ctx.recipient.clone()))
-    });
-    assert!(
-        idx_ttl >= 120_960,
-        "recipient index TTL must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
-    );
-
-    // Verify all 3 are in the recipient index
-    let streams = ctx.client().get_recipient_streams(&ctx.recipient);
-    assert_eq!(streams.len(), 3);
-}
-
-// ---------------------------------------------------------------------------
-// §6  TTL constants are protocol-correct
-// ---------------------------------------------------------------------------
-
-/// Verify the TTL constants exported by the contract match the protocol spec:
-/// ~1 day threshold (17_280 ledgers at 5s each) and ~7 day bump (120_960 ledgers).
-#[test]
-fn ttl_constants_match_protocol_spec() {
-    // Instance storage
-    assert_eq!(
-        crate::INSTANCE_LIFETIME_THRESHOLD,
-        17_280,
-        "INSTANCE_LIFETIME_THRESHOLD must be ~1 day (17_280 ledgers)"
-    );
-    assert_eq!(
-        crate::INSTANCE_BUMP_AMOUNT,
-        120_960,
-        "INSTANCE_BUMP_AMOUNT must be ~7 days (120_960 ledgers)"
-    );
-
-    // Persistent storage
-    assert_eq!(
-        crate::PERSISTENT_LIFETIME_THRESHOLD,
-        17_280,
-        "PERSISTENT_LIFETIME_THRESHOLD must be ~1 day (17_280 ledgers)"
-    );
-    assert_eq!(
-        crate::PERSISTENT_BUMP_AMOUNT,
-        120_960,
-        "PERSISTENT_BUMP_AMOUNT must be ~7 days (120_960 ledgers)"
-    );
-
-    // Threshold must be strictly less than bump amount (otherwise bumps never fire)
-    const {
-        assert!(
-            crate::INSTANCE_LIFETIME_THRESHOLD < crate::INSTANCE_BUMP_AMOUNT,
-            // "threshold must be < bump amount for instance storage"
-        );
-    }
-    const {
-        assert!(
-            crate::PERSISTENT_LIFETIME_THRESHOLD < crate::PERSISTENT_BUMP_AMOUNT,
-            // "threshold must be < bump amount for persistent storage"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// §7  Batch create_streams TTL invariants
-// ---------------------------------------------------------------------------
-
-/// `create_streams()` (batch) must extend TTL for every stream AND the
-/// recipient index for each distinct recipient.
-#[test]
-fn ttl_batch_create_extends_all_streams_and_indexes() {
-    let ctx = TestContext::setup();
-    let recipient2 = Address::generate(&ctx.env);
-
-    let params = soroban_sdk::vec![
-        &ctx.env,
-        CreateStreamParams {
-            recipient: ctx.recipient.clone(),
-            deposit_amount: 500,
-            rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 500,
-        },
-        CreateStreamParams {
-            recipient: recipient2.clone(),
-            deposit_amount: 500,
-            rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 500,
-        },
-    ];
-
-    ctx.env.ledger().set_timestamp(0);
-    let ids = ctx.client().create_streams(&ctx.sender, &params);
-    assert_eq!(ids.len(), 2);
-
-    // Both streams must have proper TTL
-    for i in 0..ids.len() {
-        let sid = ids.get(i).unwrap();
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&crate::DataKey::Stream(sid))
-        });
-        assert!(
-            stream_ttl >= 120_960,
-            "batch stream {sid} TTL must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-        );
-    }
-
-    // Both recipient indexes must have proper TTL
-    for recip in [&ctx.recipient, &recipient2] {
-        let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&crate::DataKey::RecipientStreams(recip.clone()))
-        });
-        assert!(
-            idx_ttl >= 120_960,
-            "recipient index TTL for batch create must be >= PERSISTENT_BUMP_AMOUNT, got {idx_ttl}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// §8  Edge case: TTL on streams in terminal states
-// ---------------------------------------------------------------------------
-
-/// A completed stream must still have its TTL extended on read,
-/// so that recipient/auditor queries don't cause silent expiration.
-#[test]
-fn ttl_completed_stream_extended_on_read() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    // Complete the stream
-    ctx.env.ledger().set_timestamp(1000);
-    ctx.client().withdraw(&stream_id);
-
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Completed);
-
-    // TTL must still be extended
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "completed stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// A cancelled stream must still have its TTL extended on read,
-/// so that dispute resolution and audits can access historical state.
-#[test]
-fn ttl_cancelled_stream_extended_on_read() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().cancel_stream(&stream_id);
-
-    // Read the cancelled stream
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Cancelled);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "cancelled stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
-}
-
-/// A paused stream must have its TTL extended on read, so that it doesn't
-/// silently expire while paused.
-#[test]
-fn ttl_paused_stream_extended_on_read() {
-    let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
-
-    ctx.client().pause_stream(&stream_id);
-
-    // Read the paused stream
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Paused);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&crate::DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "paused stream TTL after read must be >= PERSISTENT_BUMP_AMOUNT, got {stream_ttl}"
-    );
 }

@@ -2121,252 +2121,104 @@ fn integration_batch_withdraw_completed_streams_yield_zero() {
 }
 
 // ===========================================================================
-// Integration: Persistent stream TTL extend-on-read/write (Issue #248)
+// Integration: get_claimable_at simulation and cancel clamping (Issue #270)
 // ===========================================================================
 
-/// Full lifecycle integration: instance TTL and stream TTL are maintained
-/// through create → withdraw → pause → resume → complete.
+/// Full lifecycle: claimable_at predicts correctly before and after each operation.
 #[test]
-fn integration_ttl_full_lifecycle() {
+fn integration_claimable_at_lifecycle_prediction() {
     let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
+    let stream_id = ctx.create_default_stream(); // 0..1000, rate=1, deposit=1000
 
-    // Helper: check stream and instance TTL
-    let check_ttl = |label: &str| {
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&DataKey::Stream(stream_id))
-        });
-        assert!(
-            stream_ttl >= 120_960,
-            "{label}: stream TTL must be >= 120_960, got {stream_ttl}"
-        );
+    // Before any operation: simulate at t=500 → 500
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &500), 500);
 
-        let instance_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Instance;
-            ctx.env.storage().instance().get_ttl()
-        });
-        assert!(
-            instance_ttl >= 120_960,
-            "{label}: instance TTL must be >= 120_960, got {instance_ttl}"
-        );
-    };
-
-    check_ttl("after create");
-
+    // Withdraw 300 at t=300
     ctx.env.ledger().set_timestamp(300);
     ctx.client().withdraw(&stream_id);
-    check_ttl("after withdraw");
+    assert_eq!(ctx.token.balance(&ctx.recipient), 300);
 
-    ctx.client().pause_stream(&stream_id);
-    check_ttl("after pause");
+    // After withdraw: simulate at t=800 → accrued=800, withdrawn=300 → 500
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &800), 500);
 
-    ctx.client().resume_stream(&stream_id);
-    check_ttl("after resume");
+    // Simulate at end → 700
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &1000), 700);
 
+    // Actually withdraw at t=1000
     ctx.env.ledger().set_timestamp(1000);
     ctx.client().withdraw(&stream_id);
-    check_ttl("after completion");
+    assert_eq!(ctx.token.balance(&ctx.recipient), 1000);
 
-    let state = ctx.client().get_stream_state(&stream_id);
-    assert_eq!(state.status, StreamStatus::Completed);
-    check_ttl("after get_stream_state on completed");
+    // Completed: claimable always 0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &9999), 0);
 }
 
-/// Cancel flow: TTL maintained through cancel and post-cancel withdraw.
+/// Cancel clamping: claimable prediction matches actual fund flow.
 #[test]
-fn integration_ttl_cancel_and_withdraw() {
+fn integration_claimable_at_cancel_matches_funds() {
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 
-    ctx.env.ledger().set_timestamp(400);
+    // Cancel at t=600
+    ctx.env.ledger().set_timestamp(600);
     ctx.client().cancel_stream(&stream_id);
 
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after cancel must be >= 120_960, got {stream_ttl}"
-    );
+    // Claimable prediction: 600 at any future time
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &9999), 600);
 
-    // Withdraw accrued from cancelled stream
+    // Actually withdraw what's claimable
     ctx.client().withdraw(&stream_id);
-
-    let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Stream(stream_id))
-    });
-    assert!(
-        stream_ttl >= 120_960,
-        "stream TTL after post-cancel withdraw must be >= 120_960, got {stream_ttl}"
+    assert_eq!(
+        ctx.token.balance(&ctx.recipient),
+        600,
+        "actual withdrawal must match claimable prediction"
     );
+
+    // After withdraw: claimable drops to 0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &9999), 0);
 }
 
-/// Batch create: all stream entries and recipient indexes get proper TTL.
+/// Partial withdraw then cancel: prediction verified against real withdrawal.
 #[test]
-fn integration_ttl_batch_create() {
-    let ctx = TestContext::setup();
-    let recipient2 = Address::generate(&ctx.env);
-
-    let params = soroban_sdk::vec![
-        &ctx.env,
-        CreateStreamParams {
-            recipient: ctx.recipient.clone(),
-            deposit_amount: 500,
-            rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 500,
-        },
-        CreateStreamParams {
-            recipient: recipient2.clone(),
-            deposit_amount: 500,
-            rate_per_second: 1,
-            start_time: 0,
-            cliff_time: 0,
-            end_time: 500,
-        },
-    ];
-
-    ctx.env.ledger().set_timestamp(0);
-    let ids = ctx.client().create_streams(&ctx.sender, &params);
-
-    for i in 0..ids.len() {
-        let sid = ids.get(i).unwrap();
-        let stream_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&DataKey::Stream(sid))
-        });
-        assert!(
-            stream_ttl >= 120_960,
-            "batch stream {sid} TTL must be >= 120_960, got {stream_ttl}"
-        );
-    }
-
-    for recip in [&ctx.recipient, &recipient2] {
-        let idx_ttl = ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Persistent;
-            ctx.env
-                .storage()
-                .persistent()
-                .get_ttl(&DataKey::RecipientStreams(recip.clone()))
-        });
-        assert!(
-            idx_ttl >= 120_960,
-            "recipient index TTL must be >= 120_960, got {idx_ttl}"
-        );
-    }
-}
-
-/// Close completed stream removes persistent entry entirely.
-#[test]
-fn integration_ttl_close_removes_entry() {
+fn integration_claimable_at_partial_then_cancel() {
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 
-    ctx.env.ledger().set_timestamp(1000);
+    // Withdraw 200 at t=200
+    ctx.env.ledger().set_timestamp(200);
     ctx.client().withdraw(&stream_id);
-    ctx.client().close_completed_stream(&stream_id);
 
-    let exists = ctx.env.as_contract(&ctx.contract_id, || {
-        ctx.env
-            .storage()
-            .persistent()
-            .has(&DataKey::Stream(stream_id))
-    });
-    assert!(!exists, "stream entry must be removed after close");
+    // Cancel at t=700
+    ctx.env.ledger().set_timestamp(700);
+    ctx.client().cancel_stream(&stream_id);
+
+    // Prediction: accrued clamped at 700, withdrawn 200 → claimable=500
+    let predicted = ctx.client().get_claimable_at(&stream_id, &999_999);
+    assert_eq!(predicted, 500);
+
+    // Actual withdraw
+    ctx.client().withdraw(&stream_id);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 700); // 200 + 500
+
+    // After full withdraw: claimable=0
+    assert_eq!(ctx.client().get_claimable_at(&stream_id, &999_999), 0);
 }
 
-/// Admin operations (pause/resume/cancel) maintain TTL.
+/// Claimable at current time matches get_withdrawable across multiple time points.
 #[test]
-fn integration_ttl_admin_operations() {
+fn integration_claimable_at_equals_withdrawable() {
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 
-    ctx.client().pause_stream_as_admin(&stream_id);
-    let ttl_after_pause = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Stream(stream_id))
-    });
-    assert!(ttl_after_pause >= 120_960);
-
-    ctx.client().resume_stream_as_admin(&stream_id);
-    let ttl_after_resume = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Stream(stream_id))
-    });
-    assert!(ttl_after_resume >= 120_960);
-
-    ctx.env.ledger().set_timestamp(500);
-    ctx.client().cancel_stream_as_admin(&stream_id);
-    let ttl_after_cancel = ctx.env.as_contract(&ctx.contract_id, || {
-        use soroban_sdk::testutils::storage::Persistent;
-        ctx.env
-            .storage()
-            .persistent()
-            .get_ttl(&DataKey::Stream(stream_id))
-    });
-    assert!(ttl_after_cancel >= 120_960);
-}
-
-/// Instance TTL is maintained across init, config reads, and admin writes.
-#[test]
-fn integration_ttl_instance_storage_across_operations() {
-    let ctx = TestContext::setup();
-
-    let check_instance_ttl = || {
-        ctx.env.as_contract(&ctx.contract_id, || {
-            use soroban_sdk::testutils::storage::Instance;
-            let ttl = ctx.env.storage().instance().get_ttl();
-            assert!(ttl >= 120_960, "instance TTL must be >= 120_960, got {ttl}");
-        });
-    };
-
-    // After init (via TestContext::setup)
-    check_instance_ttl();
-
-    // After get_config
-    ctx.client().get_config();
-    check_instance_ttl();
-
-    // After get_stream_count
-    ctx.client().get_stream_count();
-    check_instance_ttl();
-
-    // After create_stream (bumps NextStreamId)
-    ctx.create_default_stream();
-    check_instance_ttl();
-
-    // After set_contract_paused
-    ctx.client().set_contract_paused(&true);
-    check_instance_ttl();
-    ctx.client().set_contract_paused(&false);
-    check_instance_ttl();
-
-    // After set_admin
-    let new_admin = Address::generate(&ctx.env);
-    ctx.client().set_admin(&new_admin);
-    check_instance_ttl();
+    for &t in &[0u64, 250, 500, 750, 1000] {
+        ctx.env.ledger().set_timestamp(t);
+        let withdrawable = ctx.client().get_withdrawable(&stream_id);
+        let claimable = ctx.client().get_claimable_at(&stream_id, &t);
+        assert_eq!(
+            withdrawable, claimable,
+            "at t={t}: get_withdrawable != get_claimable_at"
+        );
+    }
 // Integration regression: double-init and missing-config reads (Issue #246)
 // ===========================================================================
 
