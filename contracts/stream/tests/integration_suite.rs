@@ -2482,3 +2482,380 @@ fn integration_init_unblocks_all_paths() {
     assert_eq!(stream_id, 0);
     assert_eq!(client.get_stream_count(), 1);
 }
+
+// ===========================================================================
+// Integration: Authorization and role-based access control (Issue #PR-template)
+// ===========================================================================
+
+/// Integration test: unauthorized sender cannot cancel another sender's stream.
+/// Verifies that only the original sender can cancel their own stream.
+///
+/// Test flow:
+/// 1. Sender A creates a stream to recipient
+/// 2. Sender B (attacker) attempts to cancel sender A's stream
+/// 3. Verify cancellation fails with authorization error
+/// 4. Verify stream state and balances remain unchanged
+/// 5. Verify original sender can still cancel successfully
+#[test]
+fn integration_unauthorized_sender_cannot_cancel_stream() {
+    let ctx = TestContext::setup();
+    let attacker = Address::generate(&ctx.env);
+
+    // Sender creates stream
+    let stream_id = ctx.create_default_stream();
+    let sender_balance_before = ctx.token.balance(&ctx.sender);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
+
+    // Advance time to 40% completion
+    ctx.env.ledger().set_timestamp(400);
+
+    // Mock auth for attacker attempting to cancel
+    ctx.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "cancel_stream",
+            args: (&stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // Attempt cancellation by unauthorized party should panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().cancel_stream(&stream_id);
+    }));
+    assert!(result.is_err(), "unauthorized cancel must fail");
+
+    // Verify stream state unchanged
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+    assert_eq!(state.cancelled_at, None);
+
+    // Verify balances unchanged
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_balance_before);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_balance_before);
+
+    // Verify original sender can still cancel successfully
+    ctx.env.mock_all_auths();
+    ctx.client().cancel_stream(&stream_id);
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+}
+
+/// Integration test: unauthorized recipient cannot withdraw from another recipient's stream.
+/// Verifies strict recipient authorization for withdrawals.
+///
+/// Test flow:
+/// 1. Create stream to recipient A
+/// 2. Attacker (recipient B) attempts to withdraw from recipient A's stream
+/// 3. Verify withdrawal fails with authorization error
+/// 4. Verify balances remain unchanged
+/// 5. Verify original recipient can still withdraw successfully
+#[test]
+fn integration_unauthorized_recipient_cannot_withdraw() {
+    let ctx = TestContext::setup();
+    let attacker = Address::generate(&ctx.env);
+
+    // Create stream to legitimate recipient
+    let stream_id = ctx.create_default_stream();
+
+    // Advance time to 50% completion
+    ctx.env.ledger().set_timestamp(500);
+
+    let recipient_balance_before = ctx.token.balance(&ctx.recipient);
+    let attacker_balance_before = ctx.token.balance(&attacker);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
+
+    // Mock auth for attacker attempting to withdraw
+    ctx.env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &attacker,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "withdraw",
+            args: (&stream_id,).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // Attempt withdrawal by unauthorized party should panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().withdraw(&stream_id);
+    }));
+    assert!(result.is_err(), "unauthorized withdraw must fail");
+
+    // Verify balances unchanged
+    assert_eq!(ctx.token.balance(&ctx.recipient), recipient_balance_before);
+    assert_eq!(ctx.token.balance(&attacker), attacker_balance_before);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_balance_before);
+
+    // Verify stream state unchanged
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.withdrawn_amount, 0);
+
+    // Verify original recipient can still withdraw successfully
+    ctx.env.mock_all_auths();
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 500);
+    assert_eq!(ctx.token.balance(&ctx.recipient), 500);
+}
+
+/// Integration test: time boundary edge cases for cliff and end_time.
+/// Verifies correct behavior at exact time boundaries.
+///
+/// Test flow:
+/// 1. Create stream with cliff at t=500, end at t=1000
+/// 2. Test withdrawal at t=499 (before cliff) → should yield 0
+/// 3. Test withdrawal at t=500 (exactly at cliff) → should yield 500
+/// 4. Test withdrawal at t=1000 (exactly at end) → should complete stream
+/// 5. Test withdrawal at t=1001 (after end) → should cap at deposit
+#[test]
+fn integration_time_boundary_cliff_and_end_exact_moments() {
+    let ctx = TestContext::setup();
+
+    // Create stream: 1000 tokens over 1000 seconds, cliff at 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,
+        &500u64,
+        &1000u64,
+    );
+
+    // Test 1: One second before cliff (t=499) → accrual is 0
+    ctx.env.ledger().set_timestamp(499);
+    let accrued_before_cliff = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_before_cliff, 0, "accrual before cliff must be 0");
+
+    let withdrawn_before_cliff = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn_before_cliff, 0, "withdrawal before cliff must be 0");
+
+    // Test 2: Exactly at cliff (t=500) → accrual is 500
+    ctx.env.ledger().set_timestamp(500);
+    let accrued_at_cliff = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_at_cliff, 500, "accrual at cliff must be 500");
+
+    let withdrawn_at_cliff = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn_at_cliff, 500, "withdrawal at cliff must be 500");
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+    assert_eq!(state.withdrawn_amount, 500);
+
+    // Test 3: Exactly at end_time (t=1000) → should complete
+    ctx.env.ledger().set_timestamp(1000);
+    let accrued_at_end = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_at_end, 1000, "accrual at end must equal deposit");
+
+    let withdrawn_at_end = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn_at_end, 500, "remaining withdrawal must be 500");
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    assert_eq!(state.withdrawn_amount, 1000);
+
+    // Test 4: After end_time (t=1001) → accrual still capped at deposit
+    ctx.env.ledger().set_timestamp(1001);
+    let accrued_after_end = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_after_end, 1000,
+        "accrual after end must cap at deposit"
+    );
+
+    // Verify final balances
+    assert_eq!(ctx.token.balance(&ctx.recipient), 1000);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), 0);
+}
+
+/// Integration test: numeric overflow protection for large values.
+/// Verifies contract handles maximum safe values without overflow.
+///
+/// Test flow:
+/// 1. Create stream with large deposit and rate values
+/// 2. Verify accrual calculation doesn't overflow
+/// 3. Verify withdrawal works correctly with large amounts
+/// 4. Verify balance conservation with large values
+#[test]
+fn integration_numeric_overflow_protection_large_values() {
+    let ctx = TestContext::setup();
+
+    // Use large but safe values (well below i128::MAX)
+    let large_deposit = 1_000_000_000_i128; // 1 billion
+    let large_rate = 1_000_000_i128; // 1 million per second
+    let duration = 1_000u64; // 1000 seconds
+
+    // Mint sufficient tokens for sender
+    let sac = StellarAssetClient::new(&ctx.env, &ctx.token_id);
+    sac.mint(&ctx.sender, &large_deposit);
+
+    // Create stream with large values
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &large_deposit,
+        &large_rate,
+        &0u64,
+        &0u64,
+        &duration,
+    );
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.deposit_amount, large_deposit);
+    assert_eq!(state.rate_per_second, large_rate);
+
+    // Verify accrual calculation at 50%
+    ctx.env.ledger().set_timestamp(500);
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    let expected_accrued = large_rate * 500; // 500_000_000_000
+    assert_eq!(accrued, expected_accrued);
+
+    // Verify withdrawal works with large amounts
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, expected_accrued);
+    assert_eq!(ctx.token.balance(&ctx.recipient), expected_accrued);
+
+    // Verify balance conservation
+    let total_supply = ctx.token.balance(&ctx.sender)
+        + ctx.token.balance(&ctx.recipient)
+        + ctx.token.balance(&ctx.contract_id);
+    assert_eq!(
+        total_supply,
+        10_000 + large_deposit,
+        "total supply must be conserved"
+    );
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    let final_withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(final_withdrawn, large_deposit - expected_accrued);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+    assert_eq!(state.withdrawn_amount, large_deposit);
+}
+
+/// Integration test: state transition consistency across all operations.
+/// Verifies that status transitions follow strict rules and emit correct events.
+///
+/// Test flow:
+/// 1. Create stream (Active)
+/// 2. Pause stream (Active → Paused)
+/// 3. Resume stream (Paused → Active)
+/// 4. Cancel stream (Active → Cancelled)
+/// 5. Withdraw from cancelled stream (stays Cancelled, not Completed)
+/// 6. Verify each transition emits correct events
+/// 7. Verify invalid transitions are rejected
+#[test]
+fn integration_state_transition_consistency_and_events() {
+    let ctx = TestContext::setup();
+
+    // Phase 1: Create stream → Active
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &2000_i128,
+        &1_i128,
+        &0u64,
+        &0u64,
+        &2000u64,
+    );
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+
+    // Phase 2: Pause stream → Paused
+    ctx.env.ledger().set_timestamp(500);
+    let events_before_pause = ctx.env.events().all().len();
+    ctx.client().pause_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Verify pause event emitted
+    let events = ctx.env.events().all();
+    let mut found_pause_event = false;
+    for i in events_before_pause..events.len() {
+        let event = events.get(i).unwrap();
+        if event.0 == ctx.contract_id {
+            let topic0 = soroban_sdk::Symbol::from_val(&ctx.env, &event.1.get(0).unwrap());
+            if topic0 == soroban_sdk::Symbol::new(&ctx.env, "paused") {
+                found_pause_event = true;
+            }
+        }
+    }
+    assert!(found_pause_event, "pause event must be emitted");
+
+    // Phase 3: Resume stream → Active
+    ctx.env.ledger().set_timestamp(800);
+    let events_before_resume = ctx.env.events().all().len();
+    ctx.client().resume_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Active);
+
+    // Verify resume event emitted
+    let events = ctx.env.events().all();
+    let mut found_resume_event = false;
+    for i in events_before_resume..events.len() {
+        let events = ctx.env.events().all();
+        let event = events.get(i).unwrap();
+        if event.0 == ctx.contract_id {
+            let topic0 = soroban_sdk::Symbol::from_val(&ctx.env, &event.1.get(0).unwrap());
+            if topic0 == soroban_sdk::Symbol::new(&ctx.env, "resumed") {
+                found_resume_event = true;
+            }
+        }
+    }
+    assert!(found_resume_event, "resume event must be emitted");
+
+    // Phase 4: Cancel stream → Cancelled
+    ctx.env.ledger().set_timestamp(1200);
+    let events_before_cancel = ctx.env.events().all().len();
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+    assert_eq!(state.cancelled_at, Some(1200));
+
+    // Verify cancel event emitted
+    let events = ctx.env.events().all();
+    let mut found_cancel_event = false;
+    for i in events_before_cancel..events.len() {
+        let event = events.get(i).unwrap();
+        if event.0 == ctx.contract_id {
+            let topic0 = soroban_sdk::Symbol::from_val(&ctx.env, &event.1.get(0).unwrap());
+            if topic0 == soroban_sdk::Symbol::new(&ctx.env, "cancelled") {
+                found_cancel_event = true;
+            }
+        }
+    }
+    assert!(found_cancel_event, "cancel event must be emitted");
+
+    // Phase 5: Withdraw from cancelled stream → stays Cancelled
+    let withdrawn = ctx.client().withdraw(&stream_id);
+    assert_eq!(withdrawn, 1200);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state.status,
+        StreamStatus::Cancelled,
+        "cancelled stream must not transition to Completed"
+    );
+
+    // Phase 6: Verify invalid transitions are rejected
+    // Cannot pause cancelled stream
+    let result = ctx.client().try_pause_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+
+    // Cannot resume cancelled stream
+    let result = ctx.client().try_resume_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+
+    // Cannot cancel already cancelled stream
+    let result = ctx.client().try_cancel_stream(&stream_id);
+    assert_eq!(result, Err(Ok(ContractError::InvalidState)));
+}
