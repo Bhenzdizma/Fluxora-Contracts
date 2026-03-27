@@ -1,13 +1,14 @@
 extern crate std;
 
 use fluxora_stream::{
-    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamStatus,
+    ContractError, ContractPauseChanged, CreateStreamParams, FluxoraStream, FluxoraStreamClient,
+    GlobalEmergencyPauseChanged, StreamEvent, StreamStatus,
 };
 use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Env, FromVal, IntoVal,
+    vec, Address, Env, FromVal, IntoVal, Symbol, TryFromVal,
 };
 
 struct TestContext<'a> {
@@ -2838,4 +2839,150 @@ fn integration_create_streams_single_token_pull_equals_sum() {
     // Total pulled = 1000 + 2000 + 500 = 3500
     assert_eq!(ctx.token.balance(&ctx.sender), sender_before - 3500);
     assert_eq!(ctx.token.balance(&ctx.contract_id), 3500);
+}
+
+// ---------------------------------------------------------------------------
+// Integration — global emergency pause & admin event parity
+// ---------------------------------------------------------------------------
+
+/// When the global emergency pause is engaged, routine user mutations are blocked
+/// and the get_global_emergency_paused view reflects the new state.
+#[test]
+fn integration_global_emergency_pause_blocks_user_mutations() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Engage emergency pause
+    ctx.client().set_global_emergency_paused(&true);
+    assert!(ctx.client().get_global_emergency_paused());
+
+    // withdraw is blocked
+    let result = ctx.client().try_withdraw(&stream_id);
+    assert!(result.is_err(), "withdraw must be blocked during emergency pause");
+
+    // cancel_stream (sender path) is blocked
+    let result = ctx.client().try_cancel_stream(&stream_id);
+    assert!(result.is_err(), "cancel_stream must be blocked during emergency pause");
+
+    // create_stream is blocked
+    ctx.env.ledger().set_timestamp(0);
+    let result = ctx.client().try_create_stream(
+        &ctx.sender, &ctx.recipient, &1000, &1, &0, &0, &1000,
+    );
+    assert!(result.is_err(), "create_stream must be blocked during emergency pause");
+
+    // Clear emergency pause — mutations resume
+    ctx.client().set_global_emergency_paused(&false);
+    assert!(!ctx.client().get_global_emergency_paused());
+
+    ctx.env.ledger().set_timestamp(500);
+    let amount = ctx.client().withdraw(&stream_id);
+    assert_eq!(amount, 500, "withdraw must succeed after emergency pause is cleared");
+}
+
+/// Admin overrides work and emit correctly-shaped events while emergency pause is active.
+#[test]
+fn integration_admin_overrides_work_during_emergency_pause() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    ctx.client().set_global_emergency_paused(&true);
+
+    // Admin pause emits ("paused", stream_id) → StreamEvent::Paused
+    ctx.client().pause_stream_as_admin(&stream_id);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::from_val(&ctx.env, &last.1.get(0).unwrap()),
+        Symbol::new(&ctx.env, "paused")
+    );
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::Paused(stream_id)
+    );
+
+    // Admin resume emits ("resumed", stream_id) → StreamEvent::Resumed
+    ctx.client().resume_stream_as_admin(&stream_id);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::from_val(&ctx.env, &last.1.get(0).unwrap()),
+        Symbol::new(&ctx.env, "resumed")
+    );
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::Resumed(stream_id)
+    );
+
+    // Admin cancel emits ("cancelled", stream_id) → StreamEvent::StreamCancelled
+    ctx.client().cancel_stream_as_admin(&stream_id);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::from_val(&ctx.env, &last.1.get(0).unwrap()),
+        Symbol::new(&ctx.env, "cancelled")
+    );
+    assert_eq!(
+        Option::<StreamEvent>::from_val(&ctx.env, &last.2).unwrap(),
+        StreamEvent::StreamCancelled(stream_id)
+    );
+}
+
+/// set_contract_paused emits a ct_pause event on both pause and unpause.
+#[test]
+fn integration_set_contract_paused_emits_event() {
+    let ctx = TestContext::setup();
+
+    ctx.client().set_contract_paused(&true);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::from_val(&ctx.env, &last.1.get(0).unwrap()),
+        Symbol::new(&ctx.env, "ct_pause")
+    );
+    let payload = ContractPauseChanged::try_from_val(&ctx.env, &last.2)
+        .expect("ct_pause data must be ContractPauseChanged");
+    assert!(payload.paused);
+
+    ctx.client().set_contract_paused(&false);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    let payload = ContractPauseChanged::try_from_val(&ctx.env, &last.2)
+        .expect("ct_pause data must be ContractPauseChanged on unpause");
+    assert!(!payload.paused);
+}
+
+/// set_global_emergency_paused emits a gl_pause event on both pause and clear.
+#[test]
+fn integration_set_global_emergency_paused_emits_event() {
+    let ctx = TestContext::setup();
+
+    ctx.client().set_global_emergency_paused(&true);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(
+        Symbol::from_val(&ctx.env, &last.1.get(0).unwrap()),
+        Symbol::new(&ctx.env, "gl_pause")
+    );
+    let payload = GlobalEmergencyPauseChanged::try_from_val(&ctx.env, &last.2)
+        .expect("gl_pause data must be GlobalEmergencyPauseChanged");
+    assert!(payload.paused);
+
+    ctx.client().set_global_emergency_paused(&false);
+    let events = ctx.env.events().all();
+    let last = events.last().unwrap();
+    let payload = GlobalEmergencyPauseChanged::try_from_val(&ctx.env, &last.2)
+        .expect("gl_pause data must be GlobalEmergencyPauseChanged on clear");
+    assert!(!payload.paused);
+}
+
+/// Uninitialised contract: set_global_emergency_paused must fail with missing config.
+#[test]
+#[should_panic]
+fn integration_uninitialised_set_global_emergency_paused_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FluxoraStream);
+    let client = FluxoraStreamClient::new(&env, &contract_id);
+    client.set_global_emergency_paused(&true);
 }

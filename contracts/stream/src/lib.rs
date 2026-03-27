@@ -157,6 +157,16 @@ pub struct GlobalEmergencyPauseChanged {
     pub paused: bool,
 }
 
+/// Emitted when the contract admin toggles the creation-pause flag via `set_contract_paused`.
+///
+/// When `paused == true`, `create_stream` and `create_streams` revert with
+/// `ContractError::ContractPaused`. All other operations are unaffected.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractPauseChanged {
+    pub paused: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stream {
@@ -197,8 +207,11 @@ pub enum DataKey {
     NextStreamId,              // Instance storage for the auto-incrementing ID counter.
     Stream(u64),               // Persistent storage for individual stream data (O(1) lookup).
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
-    /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
+    /// Creation-pause flag (bool): blocks `create_stream`/`create_streams` when true.
     GlobalPaused,
+    /// Global emergency-pause flag (bool): blocks all user-facing mutations when true.
+    /// Appended after `GlobalPaused` to avoid shifting existing discriminants.
+    GlobalEmergencyPaused,
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,13 +1515,31 @@ impl FluxoraStream {
         Ok(())
     }
 
-    /// Set global pause; create_stream/create_streams panic_with_error(ContractPaused) while true.
+    /// Toggle the **creation pause** flag (admin only).
+    ///
+    /// When `paused == true`, `create_stream` and `create_streams` return
+    /// `ContractError::ContractPaused`. All other operations are unaffected.
+    /// Call with `paused == false` to re-enable stream creation.
+    ///
+    /// This is a lightweight maintenance pause (e.g. during parameter migrations).
+    /// For a broader emergency stop that also blocks withdrawals and cancellations,
+    /// use `set_global_emergency_paused` instead.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Events
+    /// - Publishes topic `ct_pause` with [`ContractPauseChanged`] data.
     pub fn set_contract_paused(env: Env, paused: bool) -> Result<(), ContractError> {
         get_admin(&env)?.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::GlobalPaused, &paused);
         bump_instance_ttl(&env);
+
+        env.events()
+            .publish((symbol_short!("ct_pause"),), ContractPauseChanged { paused });
+
         Ok(())
     }
 
@@ -2210,9 +2241,8 @@ impl FluxoraStream {
     ///
     /// # Events
     /// - Publishes topic `gl_pause` with [`GlobalEmergencyPauseChanged`] data.
-    pub fn set_global_emergency_paused(env: Env, paused: bool) {
-        let admin = get_admin(&env);
-        admin.require_auth();
+    pub fn set_global_emergency_paused(env: Env, paused: bool) -> Result<(), ContractError> {
+        get_admin(&env)?.require_auth();
 
         env.storage()
             .instance()
@@ -2223,6 +2253,8 @@ impl FluxoraStream {
             (symbol_short!("gl_pause"),),
             GlobalEmergencyPauseChanged { paused },
         );
+
+        Ok(())
     }
 }
 
