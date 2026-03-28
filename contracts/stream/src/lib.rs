@@ -2547,6 +2547,61 @@ impl FluxoraStream {
         );
         Ok(())
     }
+
+    /// Explicitly clear the **global emergency pause** and restore normal contract behaviour.
+    ///
+    /// This is the dedicated, unambiguous counterpart to `set_global_emergency_paused(true)`.
+    /// Calling it is equivalent to `set_global_emergency_paused(false)` but emits a distinct
+    /// `GlobalResumed` event so that incident-response tooling and indexers can distinguish a
+    /// deliberate post-incident resume from a routine toggle.
+    ///
+    /// # Authorization
+    /// - Requires authorization from the contract admin.
+    ///
+    /// # Errors
+    /// - Returns `ContractError::InvalidState` if the contract is **not** currently in
+    ///   emergency pause (prevents spurious resume events and double-resume confusion).
+    ///
+    /// # State Changes
+    /// - Clears `DataKey::GlobalEmergencyPaused` (sets it to `false`).
+    /// - All user-facing mutations that were blocked by the emergency pause are immediately
+    ///   re-enabled: `create_stream`, `create_streams`, `withdraw`, `withdraw_to`,
+    ///   `batch_withdraw`, `cancel_stream`, `update_rate_per_second`,
+    ///   `shorten_stream_end_time`, `extend_stream_end_time`.
+    ///
+    /// # Events
+    /// - Publishes topic `gl_resume` with [`GlobalResumed`] data containing the ledger
+    ///   timestamp at which the resume occurred.
+    ///
+    /// # Post-incident checklist
+    /// After calling `global_resume`, operators should:
+    /// 1. Verify `get_global_emergency_paused()` returns `false`.
+    /// 2. Confirm the `gl_resume` event appears in the transaction record.
+    /// 3. Run smoke-test transactions (e.g. a small `create_stream`) to confirm normal operation.
+    /// 4. Review any streams that were paused or cancelled during the incident window.
+    /// 5. Communicate the all-clear to protocol users and downstream integrators.
+    pub fn global_resume(env: Env) -> Result<(), ContractError> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        if !is_global_emergency_paused(&env) {
+            return Err(ContractError::InvalidState);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalEmergencyPaused, &false);
+        bump_instance_ttl(&env);
+
+        env.events().publish(
+            (symbol_short!("gl_resume"),),
+            GlobalResumed {
+                resumed_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
